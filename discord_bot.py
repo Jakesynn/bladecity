@@ -7,6 +7,7 @@ from typing import Optional
 
 import aiohttp
 import discord
+from discord import app_commands
 from discord.ext import commands, tasks
 
 # ---------------------------------------------------------------------------
@@ -16,7 +17,7 @@ from discord.ext import commands, tasks
 DISCORD_BOT_TOKEN = os.environ.get("DISCORD_BOT_TOKEN", "")
 ANNOUNCE_CHANNEL_ID = int(os.environ.get("ANNOUNCE_CHANNEL_ID", "1518363017836888244"))
 
-GRAPHQL_ACCESS_TOKEN = "OC|752908224809889|"
+GRAPHQL_ACCESS_TOKEN = os.environ.get("GRAPHQL_ACCESS_TOKEN", "")
 APP_ID = 1614607450665189
 DOCID = 6771539532935162
 GAME_NAME = "Blade City"
@@ -26,6 +27,12 @@ EMBED_COLOR = discord.Color.from_rgb(54, 57, 63)  # grey
 
 POLL_INTERVAL_SECONDS = 300  # 5 minutes
 STATE_FILE = "version_state.json"
+
+# --- Team system config ---
+TEAM_APPROVAL_CHANNEL_ID = 1518372067475456021
+TEAM_LEADER_LOG_CHANNEL_ID = 1518372889861030039
+TEAM_CATEGORY_ID = 1518372256395427931
+TEAM_DB_CHANNEL_ID = 1518373722350817391
 
 # ---------------------------------------------------------------------------
 # GraphQL client (same logic as before)
@@ -65,7 +72,10 @@ class GraphQLClient:
 
         try:
             async with self._session.post(self.url, data=payload) as resp:
-                resp.raise_for_status()
+                if resp.status >= 400:
+                    body = await resp.text()
+                    print(f"GraphQL error {resp.status}: {body[:500]}")
+                    return None
                 return await resp.json(content_type=None)
         except Exception as e:
             print(f"GraphQL error: {type(e).__name__}: {e}")
@@ -189,14 +199,122 @@ def save_state(state: dict) -> None:
 # ---------------------------------------------------------------------------
 
 intents = discord.Intents.default()
+intents.members = True
 bot = commands.Bot(command_prefix="!", intents=intents)
 
 state = load_state()
 
 
+# ---------------------------------------------------------------------------
+# Team system: persistence (stored as a JSON blob in a Discord channel,
+# since the host's filesystem isn't guaranteed to persist across deploys)
+# ---------------------------------------------------------------------------
+
+teams: dict = {}  # { team_name: {leader_id, members: [...], role_id, channel_id} }
+_teams_db_message: Optional[discord.Message] = None
+
+
+async def load_teams_from_db() -> None:
+    """Scan the DB channel for the bot's existing state message and load it.
+    If none exists yet, create one with an empty team dict."""
+    global _teams_db_message, teams
+
+    channel = bot.get_channel(TEAM_DB_CHANNEL_ID)
+    if channel is None:
+        print(f"WARNING: team DB channel {TEAM_DB_CHANNEL_ID} not found - team data won't persist.")
+        return
+
+    async for msg in channel.history(limit=100):
+        if msg.author.id == bot.user.id and "```json" in msg.content:
+            raw = msg.content.split("```json", 1)[1].rsplit("```", 1)[0].strip()
+            try:
+                teams = json.loads(raw)
+            except json.JSONDecodeError:
+                teams = {}
+            _teams_db_message = msg
+            print(f"Loaded {len(teams)} team(s) from DB channel.")
+            return
+
+    teams = {}
+    _teams_db_message = await channel.send(f"```json\n{json.dumps(teams, indent=2)}\n```")
+    print("No existing team DB message found - created a new one.")
+
+
+async def save_teams_to_db() -> None:
+    """Persist the current `teams` dict by editing the bot's DB message in place."""
+    global _teams_db_message
+
+    channel = bot.get_channel(TEAM_DB_CHANNEL_ID)
+    if channel is None:
+        print(f"WARNING: team DB channel {TEAM_DB_CHANNEL_ID} not found - could not save team data.")
+        return
+
+    content = f"```json\n{json.dumps(teams, indent=2)}\n```"
+    if len(content) > 1990:
+        print("WARNING: team DB content is approaching Discord's 2000-char message limit. "
+              "Consider migrating to a real database if you have many teams.")
+
+    if _teams_db_message is None:
+        _teams_db_message = await channel.send(content)
+        return
+
+    try:
+        await _teams_db_message.edit(content=content)
+    except discord.NotFound:
+        _teams_db_message = await channel.send(content)
+
+
+def find_team_by_leader(user_id: int) -> Optional[str]:
+    for name, t in teams.items():
+        if t["leader_id"] == user_id:
+            return name
+    return None
+
+
+def find_team_by_member(user_id: int) -> Optional[str]:
+    for name, t in teams.items():
+        if user_id in t.get("members", []):
+            return name
+    return None
+
+
+async def reattach_pending_views() -> None:
+    """After a restart, Discord drops in-memory view state. Re-register a
+    live view (bound to its original custom_id) for any team-creation request
+    in the approval channel that hasn't been resolved yet, so old buttons
+    keep working. (Pending /inviteuser invites, which can be posted in any
+    channel, aren't re-scanned - if the bot restarts mid-invite, ask the
+    leader to resend it.)"""
+    channel = bot.get_channel(TEAM_APPROVAL_CHANNEL_ID)
+    if channel is None:
+        return
+
+    count = 0
+    async for msg in channel.history(limit=200):
+        if msg.author.id != bot.user.id or not msg.components:
+            continue
+        if msg.embeds and any(f.name == "Status" for f in msg.embeds[0].fields):
+            continue  # already resolved
+
+        try:
+            buttons = msg.components[0].children
+            accept_custom_id = next(c.custom_id for c in buttons if "accept" in c.custom_id)
+            team_name, leader_id = TeamCreationView._parse(accept_custom_id)
+        except (StopIteration, ValueError, IndexError):
+            continue
+
+        bot.add_view(TeamCreationView(team_name, leader_id), message_id=msg.id)
+        count += 1
+
+    if count:
+        print(f"Re-attached {count} pending team-creation view(s).")
+
+
 @bot.event
 async def on_ready():
     print(f"Logged in as {bot.user} (id={bot.user.id})")
+    await load_teams_from_db()
+    await reattach_pending_views()
     try:
         synced = await bot.tree.sync()
         print(f"Synced {len(synced)} slash command(s)")
@@ -312,9 +430,219 @@ async def trackstatus_cmd(ctx: commands.Context):
     )
 
 
+# ---------------------------------------------------------------------------
+# Team system: UI views
+# ---------------------------------------------------------------------------
+
+
+class TeamCreationView(discord.ui.View):
+    """Approve/decline a team-creation request.
+    State (team name + leader id) is encoded in each button's custom_id so the
+    buttons keep working correctly even after a bot restart, when a fresh
+    View instance with no constructor args gets matched to old messages."""
+
+    def __init__(self, team_name: str = "", leader_id: int = 0):
+        super().__init__(timeout=None)
+        self.accept_btn.custom_id = f"team_create_accept|{team_name}|{leader_id}"
+        self.decline_btn.custom_id = f"team_create_decline|{team_name}|{leader_id}"
+
+    @staticmethod
+    def _parse(custom_id: str) -> tuple[str, int]:
+        _, team_name, leader_id = custom_id.split("|", 2)
+        return team_name, int(leader_id)
+
+    async def _disable_and_label(self, interaction: discord.Interaction, label: str):
+        for child in self.children:
+            child.disabled = True
+        embed = interaction.message.embeds[0]
+        embed.add_field(name="Status", value=label, inline=False)
+        await interaction.response.edit_message(embed=embed, view=self)
+
+    @discord.ui.button(label="Accept", style=discord.ButtonStyle.green, custom_id="team_create_accept|placeholder|0")
+    async def accept_btn(self, interaction: discord.Interaction, button: discord.ui.Button):
+        team_name, leader_id = self._parse(button.custom_id)
+
+        if not interaction.user.guild_permissions.manage_roles:
+            await interaction.response.send_message(
+                "You need the Manage Roles permission to approve team requests.", ephemeral=True
+            )
+            return
+
+        if team_name in teams:
+            await interaction.response.send_message("That team already exists.", ephemeral=True)
+            return
+
+        guild = interaction.guild
+        leader = guild.get_member(leader_id)
+        if leader is None:
+            await interaction.response.send_message("The requesting user is no longer in the server.", ephemeral=True)
+            return
+
+        role = await guild.create_role(name=f"{team_name} Team", reason=f"Team approved by {interaction.user}")
+        await leader.add_roles(role, reason="Team leader")
+
+        category = guild.get_channel(TEAM_CATEGORY_ID)
+        overwrites = {
+            guild.default_role: discord.PermissionOverwrite(view_channel=False),
+            role: discord.PermissionOverwrite(view_channel=True, send_messages=True, read_message_history=True),
+        }
+        channel = await guild.create_text_channel(
+            name=f"🏆┃{team_name}-discussion",
+            category=category,
+            overwrites=overwrites,
+            reason=f"Team channel for {team_name}",
+        )
+
+        teams[team_name] = {
+            "leader_id": leader_id,
+            "members": [leader_id],
+            "role_id": role.id,
+            "channel_id": channel.id,
+        }
+        await save_teams_to_db()
+
+        log_channel = bot.get_channel(TEAM_LEADER_LOG_CHANNEL_ID)
+        if log_channel is not None:
+            await log_channel.send(
+                f"👑 {leader.mention} is now leader of **{team_name}** "
+                f"(role: {role.mention}, channel: {channel.mention})"
+            )
+
+        await self._disable_and_label(interaction, f"✅ Approved by {interaction.user.mention}")
+
+    @discord.ui.button(label="Decline", style=discord.ButtonStyle.red, custom_id="team_create_decline|placeholder|0")
+    async def decline_btn(self, interaction: discord.Interaction, button: discord.ui.Button):
+        if not interaction.user.guild_permissions.manage_roles:
+            await interaction.response.send_message(
+                "You need the Manage Roles permission to decline team requests.", ephemeral=True
+            )
+            return
+        await self._disable_and_label(interaction, f"❌ Declined by {interaction.user.mention}")
+
+
+class TeamInviteView(discord.ui.View):
+    """Accept/decline a team invite. State encoded in custom_id, same reasoning as above."""
+
+    def __init__(self, team_name: str = "", invited_user_id: int = 0):
+        super().__init__(timeout=None)
+        self.accept_btn.custom_id = f"team_invite_accept|{team_name}|{invited_user_id}"
+        self.decline_btn.custom_id = f"team_invite_decline|{team_name}|{invited_user_id}"
+
+    @staticmethod
+    def _parse(custom_id: str) -> tuple[str, int]:
+        _, team_name, invited_user_id = custom_id.split("|", 2)
+        return team_name, int(invited_user_id)
+
+    async def _disable_and_label(self, interaction: discord.Interaction, label: str):
+        for child in self.children:
+            child.disabled = True
+        embed = interaction.message.embeds[0]
+        embed.add_field(name="Status", value=label, inline=False)
+        await interaction.response.edit_message(embed=embed, view=self)
+
+    @discord.ui.button(label="Accept", style=discord.ButtonStyle.green, custom_id="team_invite_accept|placeholder|0")
+    async def accept_btn(self, interaction: discord.Interaction, button: discord.ui.Button):
+        team_name, invited_user_id = self._parse(button.custom_id)
+
+        if interaction.user.id != invited_user_id:
+            await interaction.response.send_message("This invite isn't addressed to you.", ephemeral=True)
+            return
+
+        team = teams.get(team_name)
+        if team is None:
+            await interaction.response.send_message("That team no longer exists.", ephemeral=True)
+            return
+
+        guild = interaction.guild
+        role = guild.get_role(team["role_id"])
+        member = guild.get_member(invited_user_id)
+
+        if role is not None and member is not None:
+            await member.add_roles(role, reason=f"Joined team {team_name}")
+
+        if invited_user_id not in team["members"]:
+            team["members"].append(invited_user_id)
+            await save_teams_to_db()
+
+        await self._disable_and_label(interaction, f"✅ {member.mention if member else 'User'} joined the team")
+
+    @discord.ui.button(label="Decline", style=discord.ButtonStyle.red, custom_id="team_invite_decline|placeholder|0")
+    async def decline_btn(self, interaction: discord.Interaction, button: discord.ui.Button):
+        _, invited_user_id = self._parse(button.custom_id)
+        if interaction.user.id != invited_user_id:
+            await interaction.response.send_message("This invite isn't addressed to you.", ephemeral=True)
+            return
+        await self._disable_and_label(interaction, f"❌ {interaction.user.mention} declined")
+
+
+# ---------------------------------------------------------------------------
+# Team system: slash commands
+# ---------------------------------------------------------------------------
+
+
+@bot.tree.command(name="createteam", description="Request to create a new team")
+@app_commands.describe(name="The name of the team")
+async def createteam_cmd(interaction: discord.Interaction, name: str):
+    if name in teams:
+        await interaction.response.send_message("A team with that name already exists.", ephemeral=True)
+        return
+
+    approval_channel = bot.get_channel(TEAM_APPROVAL_CHANNEL_ID)
+    if approval_channel is None:
+        await interaction.response.send_message(
+            "Couldn't find the team approval channel - contact an admin.", ephemeral=True
+        )
+        return
+
+    embed = discord.Embed(
+        title="Team Creation Request",
+        description=f"{interaction.user.mention} wants to create the team **{name}**.",
+        color=EMBED_COLOR,
+        timestamp=discord.utils.utcnow(),
+    )
+    embed.set_footer(text=f"Requested by {interaction.user}")
+
+    view = TeamCreationView(name, interaction.user.id)
+    await approval_channel.send(embed=embed, view=view)
+    await interaction.response.send_message(
+        f"Your request to create **{name}** has been sent to <#{TEAM_APPROVAL_CHANNEL_ID}> for approval.",
+        ephemeral=True,
+    )
+
+
+@bot.tree.command(name="inviteuser", description="Invite a user to your team (team leaders only)")
+@app_commands.describe(user="The user to invite")
+async def inviteuser_cmd(interaction: discord.Interaction, user: discord.Member):
+    team_name = find_team_by_leader(interaction.user.id)
+    if team_name is None:
+        await interaction.response.send_message("You're not the leader of any team.", ephemeral=True)
+        return
+
+    team = teams[team_name]
+    if user.id in team["members"]:
+        await interaction.response.send_message(f"{user.mention} is already in **{team_name}**.", ephemeral=True)
+        return
+
+    if user.bot:
+        await interaction.response.send_message("You can't invite bots to a team.", ephemeral=True)
+        return
+
+    embed = discord.Embed(
+        title="Team Invite",
+        description=f"{user.mention}, you've been invited to join **{team_name}** by {interaction.user.mention}.",
+        color=EMBED_COLOR,
+        timestamp=discord.utils.utcnow(),
+    )
+    view = TeamInviteView(team_name, user.id)
+    await interaction.response.send_message(embed=embed, view=view)
+
+
 if __name__ == "__main__":
     if not DISCORD_BOT_TOKEN:
         raise SystemExit("Set the DISCORD_BOT_TOKEN environment variable before running.")
+    if not GRAPHQL_ACCESS_TOKEN or GRAPHQL_ACCESS_TOKEN.endswith("|"):
+        print("WARNING: GRAPHQL_ACCESS_TOKEN is missing or looks incomplete (format should be "
+              "OC|<app_id>|<app_secret>) - GraphQL requests will fail with 400 until this is fixed.")
     if not ANNOUNCE_CHANNEL_ID:
         print("WARNING: ANNOUNCE_CHANNEL_ID not set - bot will not post announcements, "
               "only respond to !version / !trackstatus commands.")
