@@ -33,6 +33,7 @@ TEAM_APPROVAL_CHANNEL_ID = 1518372067475456021
 TEAM_LEADER_LOG_CHANNEL_ID = 1518372889861030039
 TEAM_CATEGORY_ID = 1518372256395427931
 TEAM_DB_CHANNEL_ID = 1518373722350817391
+GUILD_ID = int(os.environ.get("GUILD_ID", "0"))  # needed to resolve the guild when buttons are clicked in DMs
 
 # ---------------------------------------------------------------------------
 # GraphQL client (same logic as before)
@@ -278,6 +279,20 @@ def find_team_by_member(user_id: int) -> Optional[str]:
     return None
 
 
+def resolve_guild(team: Optional[dict] = None) -> Optional[discord.Guild]:
+    """Find the relevant guild even when the interaction came from a DM
+    (e.g. a team-invite button click), where interaction.guild is None."""
+    if team and team.get("guild_id"):
+        g = bot.get_guild(team["guild_id"])
+        if g is not None:
+            return g
+    if GUILD_ID:
+        g = bot.get_guild(GUILD_ID)
+        if g is not None:
+            return g
+    return bot.guilds[0] if bot.guilds else None
+
+
 async def reattach_pending_views() -> None:
     """After a restart, Discord drops in-memory view state. Re-register a
     live view (bound to its original custom_id) for any team-creation request
@@ -498,6 +513,7 @@ class TeamCreationView(discord.ui.View):
             "members": [leader_id],
             "role_id": role.id,
             "channel_id": channel.id,
+            "guild_id": guild.id,
         }
         await save_teams_to_db()
 
@@ -507,6 +523,14 @@ class TeamCreationView(discord.ui.View):
                 f"👑 {leader.mention} is now leader of **{team_name}** "
                 f"(role: {role.mention}, channel: {channel.mention})"
             )
+
+        try:
+            await leader.send(
+                f"🎉 Your team **{team_name}** was approved! You're the leader, "
+                f"and your team channel is {channel.mention}."
+            )
+        except discord.Forbidden:
+            pass  # leader has DMs disabled
 
         await self._disable_and_label(interaction, f"✅ Approved by {interaction.user.mention}")
 
@@ -553,7 +577,11 @@ class TeamInviteView(discord.ui.View):
             await interaction.response.send_message("That team no longer exists.", ephemeral=True)
             return
 
-        guild = interaction.guild
+        guild = resolve_guild(team)
+        if guild is None:
+            await interaction.response.send_message("Couldn't resolve the server for this team.", ephemeral=True)
+            return
+
         role = guild.get_role(team["role_id"])
         member = guild.get_member(invited_user_id)
 
@@ -585,6 +613,12 @@ class TeamInviteView(discord.ui.View):
 async def createteam_cmd(interaction: discord.Interaction, name: str):
     if name in teams:
         await interaction.response.send_message("A team with that name already exists.", ephemeral=True)
+        return
+
+    if find_team_by_leader(interaction.user.id) is not None:
+        await interaction.response.send_message(
+            "You're already the leader of a team — you can't create a second one.", ephemeral=True
+        )
         return
 
     approval_channel = bot.get_channel(TEAM_APPROVAL_CHANNEL_ID)
@@ -629,12 +663,139 @@ async def inviteuser_cmd(interaction: discord.Interaction, user: discord.Member)
 
     embed = discord.Embed(
         title="Team Invite",
-        description=f"{user.mention}, you've been invited to join **{team_name}** by {interaction.user.mention}.",
+        description=f"You've been invited to join **{team_name}** by {interaction.user.mention}.",
         color=EMBED_COLOR,
         timestamp=discord.utils.utcnow(),
     )
     view = TeamInviteView(team_name, user.id)
-    await interaction.response.send_message(embed=embed, view=view)
+
+    try:
+        await user.send(embed=embed, view=view)
+    except discord.Forbidden:
+        await interaction.response.send_message(
+            f"Couldn't DM {user.mention} — they may have DMs disabled for this server.", ephemeral=True
+        )
+        return
+
+    await interaction.response.send_message(f"Invite sent to {user.mention} via DM.", ephemeral=True)
+
+
+class TeamDeleteConfirmView(discord.ui.View):
+    """Short-lived ephemeral confirmation - not registered as a persistent
+    view since it only needs to survive a few seconds while the leader
+    decides, so plain instance attributes are fine here."""
+
+    def __init__(self, team_name: str, leader_id: int):
+        super().__init__(timeout=60)
+        self.team_name = team_name
+        self.leader_id = leader_id
+
+    @discord.ui.button(label="Click Delete to confirm", style=discord.ButtonStyle.red)
+    async def delete_btn(self, interaction: discord.Interaction, button: discord.ui.Button):
+        if interaction.user.id != self.leader_id:
+            await interaction.response.send_message("This confirmation isn't for you.", ephemeral=True)
+            return
+
+        team = teams.get(self.team_name)
+        if team is None:
+            await interaction.response.edit_message(content="That team no longer exists.", view=None)
+            return
+
+        guild = resolve_guild(team)
+        if guild is not None:
+            role = guild.get_role(team["role_id"])
+            channel = guild.get_channel(team["channel_id"])
+            if role is not None:
+                await role.delete(reason=f"Team {self.team_name} deleted by leader")
+            if channel is not None:
+                await channel.delete(reason=f"Team {self.team_name} deleted by leader")
+
+        del teams[self.team_name]
+        await save_teams_to_db()
+
+        button.disabled = True
+        await interaction.response.edit_message(
+            content=f"🗑️ Team **{self.team_name}** has been deleted, along with its role and channel.", view=self
+        )
+
+
+@bot.tree.command(name="deleteteam", description="Delete your team, including its role and channel (leader only)")
+async def deleteteam_cmd(interaction: discord.Interaction):
+    team_name = find_team_by_leader(interaction.user.id)
+    if team_name is None:
+        await interaction.response.send_message("You're not the leader of any team.", ephemeral=True)
+        return
+
+    view = TeamDeleteConfirmView(team_name, interaction.user.id)
+    await interaction.response.send_message(
+        f"⚠️ This will permanently delete **{team_name}**, its role, and its channel. "
+        f"Click Delete to confirm.",
+        view=view,
+        ephemeral=True,
+    )
+
+
+async def team_name_autocomplete(interaction: discord.Interaction, current: str):
+    return [
+        app_commands.Choice(name=name, value=name)
+        for name in teams
+        if current.lower() in name.lower()
+    ][:25]
+
+
+@bot.tree.command(name="teammembers", description="List the members of a team")
+@app_commands.describe(team="The team to look up")
+@app_commands.autocomplete(team=team_name_autocomplete)
+async def teammembers_cmd(interaction: discord.Interaction, team: str):
+    t = teams.get(team)
+    if t is None:
+        await interaction.response.send_message("That team doesn't exist.", ephemeral=True)
+        return
+
+    lines = []
+    for uid in t["members"]:
+        tag = " 👑 (Leader)" if uid == t["leader_id"] else ""
+        lines.append(f"<@{uid}>{tag}")
+
+    embed = discord.Embed(
+        title=f"{team} — Members",
+        description="\n".join(lines) if lines else "No members.",
+        color=EMBED_COLOR,
+    )
+    embed.set_footer(text=f"{len(t['members'])} member(s)")
+    await interaction.response.send_message(embed=embed)
+
+
+@bot.tree.command(name="removemember", description="Remove a member from your team (leader only)")
+@app_commands.describe(user="The user to remove")
+async def removemember_cmd(interaction: discord.Interaction, user: discord.Member):
+    team_name = find_team_by_leader(interaction.user.id)
+    if team_name is None:
+        await interaction.response.send_message("You're not the leader of any team.", ephemeral=True)
+        return
+
+    team = teams[team_name]
+
+    if user.id == team["leader_id"]:
+        await interaction.response.send_message(
+            "You can't remove yourself as leader — use /deleteteam to disband the team instead.", ephemeral=True
+        )
+        return
+
+    if user.id not in team["members"]:
+        await interaction.response.send_message(f"{user.mention} isn't in **{team_name}**.", ephemeral=True)
+        return
+
+    guild = resolve_guild(team)
+    if guild is not None:
+        role = guild.get_role(team["role_id"])
+        if role is not None:
+            await user.remove_roles(role, reason=f"Removed from {team_name}")
+
+    team["members"].remove(user.id)
+    await save_teams_to_db()
+
+    await interaction.response.send_message(f"Removed {user.mention} from **{team_name}**.", ephemeral=True)
 
 
 if __name__ == "__main__":
