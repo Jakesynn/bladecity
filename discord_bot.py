@@ -1,6 +1,7 @@
 import asyncio
 import json
 import os
+import re
 import time
 from typing import Optional
 
@@ -137,12 +138,31 @@ def _find_image_url(obj) -> Optional[str]:
 
 
 async def get_banner_url(meta: Optional[dict] = None) -> Optional[str]:
+    """Fetch the game's banner image from its actual store page (og:image meta tag),
+    falling back to scanning the GraphQL response, then to GAME_BANNER_URL env var."""
+    store_url = f"https://www.meta.com/experiences/{APP_ID}/"
+    try:
+        async with aiohttp.ClientSession(timeout=aiohttp.ClientTimeout(total=15)) as session:
+            async with session.get(store_url, headers={"User-Agent": "Mozilla/5.0"}) as resp:
+                if resp.status == 200:
+                    html = await resp.text()
+                    match = re.search(
+                        r'<meta[^>]+property=["\']og:image["\'][^>]+content=["\']([^"\']+)["\']',
+                        html,
+                        re.IGNORECASE,
+                    )
+                    if match:
+                        return match.group(1)
+    except Exception as e:
+        print(f"Banner fetch error: {type(e).__name__}: {e}")
+
     if meta is None:
         meta = await fetch_store_metadata()
     if isinstance(meta, dict):
         found = _find_image_url(meta)
         if found:
             return found
+
     return os.environ.get("GAME_BANNER_URL")
 
 
@@ -247,8 +267,18 @@ async def before_loop():
     await bot.wait_until_ready()
 
 
-@bot.tree.command(name="test", description="Post a sample update-detected embed to verify formatting")
+@bot.tree.command(name="test", description="Post a sample update-detected embed to the announce channel")
 async def test_cmd(interaction: discord.Interaction):
+    await interaction.response.defer(ephemeral=True)
+
+    channel = bot.get_channel(ANNOUNCE_CHANNEL_ID)
+    if channel is None:
+        await interaction.followup.send(
+            f"Couldn't find channel `{ANNOUNCE_CHANNEL_ID}` — check ANNOUNCE_CHANNEL_ID and bot permissions.",
+            ephemeral=True,
+        )
+        return
+
     meta = await fetch_store_metadata()
     banner_url = await get_banner_url(meta)
     embed = build_update_embed(
@@ -256,7 +286,8 @@ async def test_cmd(interaction: discord.Interaction):
         new_version="1.0.0.0001",
         banner_url=banner_url,
     )
-    await interaction.response.send_message(embed=embed)
+    await channel.send(embed=embed)
+    await interaction.followup.send(f"Test embed posted in <#{ANNOUNCE_CHANNEL_ID}>.", ephemeral=True)
 
 
 @bot.command(name="version")
